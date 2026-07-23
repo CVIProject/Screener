@@ -8,3 +8,4 @@ python-multipart==0.0.20
 numpy==2.3.1
 xlsxwriter==3.2.5
 tqdm==4.67.1
+rapidfuzz==3.13.0
