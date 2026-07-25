@@ -508,15 +508,15 @@ def process_excel(
     # Additional Screening Rule
     #############################################################
 
-    # Remove stocks where 6 Month Return > 24 Month Return
-
+    # Remove stocks where either return is negative,
+    # or where the 6-month return is greater than the 24-month return
     df = df[
-        df["6-Month Return"]
-        <=
-        df["24-Month Return"]
+        (df["6-Month Return"] >= 0)
+        &
+        (df["24-Month Return"] >= 0)
+        &
+        (df["6-Month Return"] <= df["24-Month Return"])
     ].copy()
-
-
 
     df["Overall Rank"] = (
     df["Final Score"]
