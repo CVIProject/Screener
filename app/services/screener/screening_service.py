@@ -68,6 +68,11 @@ def process_excel(
         (df["REL STR"].between(77, 79))
     )
 
+    exception_filter = (
+        (df["REL STR"] >= 91) &
+        (df["EPS RTG"].between(77, 79)) 
+    )   
+
     df = df.loc[
         standard_filter | exception_filter
     ].copy()
@@ -355,6 +360,9 @@ def process_excel(
         "METALS": "MATERIALS",
         "MINING": "MATERIALS",
 
+        # REAL ESTATE
+        "REAL ESTATE": "REAL ESTATE",
+
         # INDUSTRIALS
         "BUILDING": "INDUSTRIALS",
         "AEROSPACE": "INDUSTRIALS",
@@ -364,7 +372,6 @@ def process_excel(
         "CONSUMER": "INDUSTRIALS",
         "MACHINE": "INDUSTRIALS",
         "OFFICE": "INDUSTRIALS",
-        "REAL ESTATE": "INDUSTRIALS", 
         "TRANSPORT": "INDUSTRIALS",
 
         # CONSUMER DISCRETIONARY
@@ -398,6 +405,8 @@ def process_excel(
 
         # UTILITIES
         "UTILITY": "UTILITIES",
+
+        "MISC": "MISCELLANEOUS"
     }
 
     # Normalize sector names

@@ -1,33 +1,29 @@
+from __future__ import annotations
+
+import logging
 from datetime import datetime
-from io import BytesIO
-from tempfile import TemporaryDirectory
 from pathlib import Path
 
-import pandas as pd
-from fastapi import APIRouter, File, UploadFile
+from fastapi import (
+    APIRouter,
+    File,
+    HTTPException,
+    UploadFile,
+)
 from fastapi.responses import StreamingResponse
 
 from app.core.config import settings
-from app.core.exceptions import (
-    ApplicationError,
-    CorruptedExcelFileError,
-    InvalidExcelDataError,
-    MissingColumnsError,
-)
 from app.services.regime.excel_service import (
-    get_last_existing_date,
-    read_workbook_data,
+    read_historical_workbook,
+    read_new_values_workbook,
     save_dataframe_to_excel,
 )
-from app.services.regime.fred_service import (
-    get_missing_observations,
-)
 from app.services.regime.regime_service import (
-    calculate_new_rows,
+    append_new_observations,
 )
-from app.utils.file_validation import (
-    read_and_validate_upload,
-)
+
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter(
@@ -36,150 +32,328 @@ router = APIRouter(
 )
 
 
+ALLOWED_EXCEL_EXTENSIONS = {
+    ".xlsx",
+    ".xlsm",
+}
+
+
+async def validate_excel_upload(
+    upload_file: UploadFile,
+    description: str,
+) -> bytes:
+    """
+    Validate and read an uploaded Excel file.
+    """
+    filename = upload_file.filename or ""
+
+    if not filename:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "MISSING_FILENAME",
+                "message": (
+                    f"{description} does not have a filename."
+                ),
+                "user_message": (
+                    f"Select a valid {description} and retry again."
+                ),
+            },
+        )
+
+    extension = Path(
+        filename
+    ).suffix.lower()
+
+    if extension not in ALLOWED_EXCEL_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_FILE_TYPE",
+                "message": (
+                    f"{description} has unsupported extension "
+                    f"'{extension}'."
+                ),
+                "user_message": (
+                    f"{description} must be an .xlsx or .xlsm file."
+                ),
+            },
+        )
+
+    try:
+        content = await upload_file.read()
+    except Exception as exc:
+        logger.exception(
+            "Unable to read uploaded file: %s",
+            filename,
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "FILE_READ_ERROR",
+                "message": str(exc),
+                "user_message": (
+                    f"Unable to read {description}. "
+                    "Check the file and retry again."
+                ),
+            },
+        ) from exc
+
+    if not content:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "EMPTY_FILE",
+                "message": (
+                    f"{description} is empty."
+                ),
+                "user_message": (
+                    f"{description} is empty. "
+                    "Select a valid file and retry again."
+                ),
+            },
+        )
+
+    maximum_size_bytes = (
+        settings.MAX_UPLOAD_SIZE_MB
+        * 1024
+        * 1024
+    )
+
+    if len(content) > maximum_size_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "FILE_TOO_LARGE",
+                "message": (
+                    f"{description} exceeds the "
+                    f"{settings.MAX_UPLOAD_SIZE_MB} MB limit."
+                ),
+                "user_message": (
+                    f"{description} must be smaller than "
+                    f"{settings.MAX_UPLOAD_SIZE_MB} MB."
+                ),
+            },
+        )
+
+    # XLSX and XLSM are ZIP-based formats and normally start with PK.
+    if not content.startswith(b"PK"):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_EXCEL_FILE",
+                "message": (
+                    f"{description} is not a valid Office Open XML "
+                    "Excel workbook."
+                ),
+                "user_message": (
+                    f"{description} is corrupted or is not a valid "
+                    "Excel file. Check the file and retry again."
+                ),
+            },
+        )
+
+    return content
+
+
 @router.post(
-    "/continue",
-    summary="Continue an existing BAML regime Excel file",
+    "/append",
+    summary=(
+        "Append new BAML observations to a historical regime workbook"
+    ),
     responses={
-        400: {"description": "Invalid file"},
-        413: {"description": "File too large"},
-        422: {"description": "Invalid Excel structure"},
-        502: {"description": "FRED service error"},
-        503: {"description": "Network unavailable"},
-        504: {"description": "FRED request timed out"},
-        500: {"description": "Unexpected server error"},
+        200: {
+            "description": (
+                "Updated historical regime Excel workbook"
+            )
+        },
+        400: {
+            "description": (
+                "Invalid upload or no new rows"
+            )
+        },
+        413: {
+            "description": (
+                "Uploaded file exceeds the size limit"
+            )
+        },
+        422: {
+            "description": (
+                "Excel workbook structure or data is invalid"
+            )
+        },
+        500: {
+            "description": (
+                "Unexpected regime processing error"
+            )
+        },
     },
 )
-async def continue_regime_excel(
-    file: UploadFile = File(...),
+async def append_regime_files(
+    new_values_file: UploadFile = File(
+        ...,
+        description=(
+            'Excel workbook containing a "Daily, Close" sheet '
+            "with observation_date and BAMLH0A0HYM2 columns."
+        ),
+    ),
+    historical_file: UploadFile = File(
+        ...,
+        description=(
+            "Historical regime Excel workbook containing columns A-K."
+        ),
+    ),
 ):
-    content = await read_and_validate_upload(
-        file,
-        maximum_size_mb=settings.MAX_UPLOAD_SIZE_MB,
+    """
+    Process two Excel workbooks:
+
+    1. New-values workbook:
+       - Reads only the sheet named 'Daily, Close'.
+       - Uses observation_date and BAMLH0A0HYM2.
+
+    2. Historical regime workbook:
+       - Uses the existing calculated columns A-K.
+       - Ignores extra columns.
+
+    All missing observations are calculated sequentially and appended.
+    """
+    logger.info(
+        "Regime append request started. "
+        "new_values_file=%s historical_file=%s",
+        new_values_file.filename,
+        historical_file.filename,
+    )
+
+    new_values_content = await validate_excel_upload(
+        new_values_file,
+        "New BAML values file",
+    )
+
+    historical_content = await validate_excel_upload(
+        historical_file,
+        "Historical regime file",
     )
 
     try:
-        with TemporaryDirectory() as temporary_directory:
-            input_path = (
-                Path(temporary_directory)
-                / "regime_input.xlsx"
+        new_values_dataframe = (
+            read_new_values_workbook(
+                new_values_content
             )
+        )
 
-            input_path.write_bytes(content)
+        logger.info(
+            "New-values workbook loaded. "
+            "rows=%s first_date=%s last_date=%s",
+            len(new_values_dataframe),
+            new_values_dataframe[
+                settings.DATE_COLUMN
+            ].min(),
+            new_values_dataframe[
+                settings.DATE_COLUMN
+            ].max(),
+        )
 
-            historical_df, _, _ = read_workbook_data(
-                str(input_path)
+        historical_dataframe = (
+            read_historical_workbook(
+                historical_content
             )
+        )
 
-    except ApplicationError:
-        raise
+        logger.info(
+            "Historical workbook loaded. "
+            "rows=%s latest_date=%s",
+            len(historical_dataframe),
+            historical_dataframe[
+                settings.DATE_COLUMN
+            ].max(),
+        )
 
-    except KeyError as exc:
-        missing_column = str(exc).strip("'\"")
-
-        raise MissingColumnsError(
-            missing_columns=[missing_column],
-            filename=file.filename,
-        ) from exc
-
-    except (
-        ValueError,
-        TypeError,
-        pd.errors.ParserError,
-    ) as exc:
-        message = str(exc)
-
-        if "Missing column" in message:
-            missing_column = (
-                message.split(":", maxsplit=1)[-1]
-                .strip()
+        result_dataframe, appended_dataframe = (
+            append_new_observations(
+                historical_df=historical_dataframe,
+                new_values_df=new_values_dataframe,
             )
+        )
 
-            raise MissingColumnsError(
-                missing_columns=[missing_column],
-                filename=file.filename,
-            ) from exc
+        logger.info(
+            "Regime calculations completed. "
+            "appended_rows=%s",
+            len(appended_dataframe),
+        )
 
-        raise InvalidExcelDataError(
-            message=message,
-            user_message=(
-                "The regime workbook does not contain the "
-                "expected historical data. Check the file "
-                "and retry again."
-            ),
-            details={
-                "filename": file.filename,
+        output_file = save_dataframe_to_excel(
+            result_dataframe
+        )
+
+    except ValueError as exc:
+        logger.warning(
+            "Regime validation failed: %s",
+            exc,
+        )
+
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "REGIME_VALIDATION_ERROR",
+                "message": str(exc),
+                "user_message": (
+                    f"{exc} Check the uploaded files and retry again."
+                ),
             },
         ) from exc
 
     except Exception as exc:
-        raise CorruptedExcelFileError(
-            filename=file.filename or "regime file",
-            technical_message=str(exc),
+        logger.exception(
+            "Unexpected regime processing error."
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "REGIME_PROCESSING_ERROR",
+                "message": (
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                "user_message": (
+                    "The regime workbook could not be processed. "
+                    "Check the files and retry again."
+                ),
+            },
         ) from exc
 
-    if historical_df.empty:
-        raise InvalidExcelDataError(
-            message="The regime workbook contains no valid rows.",
-            user_message=(
-                "The uploaded regime workbook contains no valid data. "
-                "Check the file and retry again."
-            ),
-        )
-
-    last_existing_date = get_last_existing_date(
-        historical_df
-    )
-
-    new_rows = await get_missing_observations(
-        last_existing_date
-    )
-
-    if new_rows.empty:
-        result_df = historical_df.copy()
-        added_rows = 0
-    else:
-        calculated_rows = calculate_new_rows(
-            historical_df,
-            new_rows,
-        )
-
-        if calculated_rows.empty:
-            raise InvalidExcelDataError(
-                message=(
-                    "New FRED observations were found, but "
-                    "no calculated rows were generated."
+    if appended_dataframe.empty:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "NO_NEW_ROWS",
+                "message": (
+                    "No new observations were appended."
                 ),
-                user_message=(
-                    "The new regime data could not be calculated. "
-                    "Check the uploaded history and retry again."
+                "user_message": (
+                    "No new observations were found. "
+                    "Check the dates and retry again."
                 ),
-            )
-
-        added_rows = len(calculated_rows)
-
-        result_df = pd.concat(
-            [
-                historical_df,
-                calculated_rows,
-            ],
-            ignore_index=True,
+            },
         )
 
-        result_df = (
-            result_df
-            .sort_values(settings.DATE_COLUMN)
-            .drop_duplicates(
-                subset=[settings.DATE_COLUMN],
-                keep="last",
-            )
-            .reset_index(drop=True)
-        )
-
-    output_file: BytesIO = save_dataframe_to_excel(
-        result_df
+    first_appended_date = (
+        appended_dataframe[
+            settings.DATE_COLUMN
+        ]
+        .min()
+        .date()
+        .isoformat()
     )
 
-    output_file.seek(0)
+    last_appended_date = (
+        appended_dataframe[
+            settings.DATE_COLUMN
+        ]
+        .max()
+        .date()
+        .isoformat()
+    )
 
     timestamp = datetime.now().strftime(
         "%Y%m%d_%H%M%S"
@@ -187,6 +361,14 @@ async def continue_regime_excel(
 
     output_filename = (
         f"BAML_Regime_Updated_{timestamp}.xlsx"
+    )
+
+    logger.info(
+        "Regime append request completed. "
+        "appended_rows=%s first_date=%s last_date=%s",
+        len(appended_dataframe),
+        first_appended_date,
+        last_appended_date,
     )
 
     return StreamingResponse(
@@ -199,6 +381,12 @@ async def continue_regime_excel(
             "Content-Disposition": (
                 f'attachment; filename="{output_filename}"'
             ),
-            "X-Added-Rows": str(added_rows),
+            "X-Appended-Rows": str(
+                len(appended_dataframe)
+            ),
+            "X-First-Appended-Date":
+                first_appended_date,
+            "X-Last-Appended-Date":
+                last_appended_date,
         },
     )

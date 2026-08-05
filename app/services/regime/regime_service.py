@@ -1,1108 +1,780 @@
+from __future__ import annotations
+
+from collections import Counter
 from typing import Optional
 
 import numpy as np
-
 import pandas as pd
 
 from app.core.config import settings
 
 
-def excel_slope(
+OUTPUT_COLUMNS = [
+    settings.DATE_COLUMN,
+    settings.VALUE_COLUMN,
+    settings.SLOPE_COLUMN,
+    settings.MEDIAN_90_COLUMN,
+    settings.MEDIAN_10Y_COLUMN,
+    settings.QUAD_COLUMN,
+    settings.RULE_3_COLUMN,
+    settings.QAD_VALUE_COLUMN,
+    settings.RULE_7_COLUMN,
+    settings.CONFIRMED_COLUMN,
+    settings.TRADE_COLUMN,
+]
 
-    values: pd.Series
 
+QUAD_TO_VALUE = {
+    "Recovery  QAD 1": 1,
+    "Growth QAD 2": 2,
+    "Overheating QAD 3": 3,
+    "recession QAD 4": 4,
+}
+
+
+def clean_optional_string(
+    value: object,
+) -> Optional[str]:
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    text = str(value).strip()
+
+    return text or None
+
+
+def clean_optional_integer(
+    value: object,
+) -> Optional[int]:
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def calculate_excel_slope(
+    values: pd.Series,
 ) -> float:
-
     """
+    Calculate a linear regression slope equivalent to Excel SLOPE.
 
-    Equivalent to Excel:
-
-        =SLOPE(y_range, x_range)
-
-    where x is:
-
+    Known x-values:
         1, 2, 3, ..., N
 
+    Known y-values:
+        BAMLH0A0HYM2 observations
     """
-
-    clean_values = (
-
+    numeric_values = (
         pd.to_numeric(
-
             values,
-
-            errors="coerce"
-
+            errors="coerce",
         )
-
         .dropna()
-
         .astype(float)
-
     )
 
-    if len(
+    if len(numeric_values) < 2:
+        return float("nan")
 
-        clean_values
-
-    ) < 2:
-
-        return np.nan
-
-    x = np.arange(
-
+    x_values = np.arange(
         1,
-
-        len(
-            clean_values
-        )
-
-        + 1
-
+        len(numeric_values) + 1,
+        dtype=float,
     )
 
-    y = (
-
-        clean_values
-
-        .to_numpy()
-
+    y_values = numeric_values.to_numpy(
+        dtype=float
     )
 
     slope = np.polyfit(
-
-        x,
-
-        y,
-
-        1
-
+        x_values,
+        y_values,
+        1,
     )[0]
 
     return round(
-
-        float(
-            slope
-        ),
-
-        3
-
+        float(slope),
+        3,
     )
 
 
-def calculate_90_day_slope(
-
-    values: pd.Series
-
+def calculate_rolling_slope(
+    all_values: pd.Series,
 ) -> float:
-
     """
-
-    Your workbook's rolling SLOPE window.
-
-    The workbook uses the current row plus
-    the preceding rolling rows.
-
-    The effective historical formula is
-    continued using the same rolling range.
-
+    Calculate the slope using the configured number of observations.
     """
-
-    # 87 previous rows + current row
-    window_size = 87
-
-    window = (
-
-        values
-
-        .iloc[
-
-            max(
-
-                0,
-
-                len(
-                    values
-                )
-
-                -
-
-                window_size
-
-                +
-
-                1
-
-            ):
-
-        ]
-
+    window = all_values.tail(
+        settings.SLOPE_WINDOW
     )
 
-    return excel_slope(
-
+    return calculate_excel_slope(
         window
-
     )
 
 
-def calculate_90_day_median(
-
-    values: pd.Series
-
+def calculate_rolling_median(
+    all_values: pd.Series,
+    window_size: int,
 ) -> float:
-
     """
-
-    Exact continuation of:
-
-        =MEDIAN(B7717:B7805)
-
-    The workbook uses the rolling
-    historical observation window.
-
+    Calculate the median from the latest window_size observations.
     """
-
-    window_size = 89
-
     window = (
-
-        values
-
-        .iloc[
-
-            max(
-
-                0,
-
-                len(
-                    values
-                )
-
-                -
-
-                window_size
-
-            ):
-
-        ]
-
+        pd.to_numeric(
+            all_values,
+            errors="coerce",
+        )
+        .dropna()
+        .tail(window_size)
     )
+
+    if window.empty:
+        return float("nan")
 
     return round(
-
-        float(
-
-            window
-
-            .median()
-
-        ),
-
-        2
-
-    )
-
-
-def calculate_10_year_median(
-
-    values: pd.Series
-
-) -> float:
-
-    """
-
-    Continuation of the existing workbook's
-    rolling 10-year median range.
-
-    Existing workbook formula:
-
-        =MEDIAN(B5207:B7805)
-
-    This is a 2,599-row historical range.
-
-    """
-
-    window_size = 2599
-
-    window = (
-
-        values
-
-        .iloc[
-
-            max(
-
-                0,
-
-                len(
-                    values
-                )
-
-                -
-
-                window_size
-
-            ):
-
-        ]
-
-    )
-
-    return round(
-
-        float(
-
-            window
-
-            .median()
-
-        ),
-
-        2
-
+        float(window.median()),
+        2,
     )
 
 
 def classify_quad(
-
     current_value: float,
-
     median_90: float,
-
-    median_10_year: float
-
+    median_10_year: float,
 ) -> str:
-
     """
-
-    Exact workbook logic:
-
-    B > D and B > E
-        recession QAD 4
-
-    B > D and B < E
-        Recovery  QAD 1
-
-    B < D and B > E
-        Overheating QAD 3
-
-    Otherwise
-        Growth QAD 2
-
+    Classify the current observation into one of four quadrants.
     """
-
     if (
-
-        current_value
-        >
-        median_90
-
-        and
-
-        current_value
-        >
-        median_10_year
-
+        current_value > median_90
+        and current_value > median_10_year
     ):
-
         return "recession QAD 4"
 
     if (
-
-        current_value
-        >
-        median_90
-
-        and
-
-        current_value
-        <
-        median_10_year
-
+        current_value > median_90
+        and current_value < median_10_year
     ):
-
         return "Recovery  QAD 1"
 
     if (
-
-        current_value
-        <
-        median_90
-
-        and
-
-        current_value
-        >
-        median_10_year
-
+        current_value < median_90
+        and current_value > median_10_year
     ):
-
         return "Overheating QAD 3"
 
     return "Growth QAD 2"
 
 
 def get_qad_value(
-
-    quad: str
-
-) -> Optional[int]:
-
-    mapping = {
-
-        "Growth QAD 2": 2,
-
-        "Recovery  QAD 1": 1,
-
-        "recession QAD 4": 4,
-
-        "Overheating QAD 3": 3
-
-    }
-
-    return mapping.get(
-
-        quad
-
-    )
+    quad: str,
+) -> int:
+    try:
+        return QUAD_TO_VALUE[quad]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown quadrant value: {quad}"
+        ) from exc
 
 
 def calculate_3_day_rule(
-
     quad_history: list[str],
-
-    previous_rule: Optional[str]
-
+    previous_rule: Optional[str],
 ) -> str:
+    """
+    Change the confirmed 3-day rule only when the latest three
+    quadrant values are identical.
+    """
+    current_quad = quad_history[-1]
 
-    if len(
+    if len(quad_history) < 3:
+        return previous_rule or current_quad
 
-        quad_history
-
-    ) < 3:
-
-        return (
-
-            previous_rule
-            or
-            quad_history[-1]
-
-        )
-
-    last_three = (
-
-        quad_history[-3:]
-
-    )
+    last_three = quad_history[-3:]
 
     if (
-
         last_three[0]
-        ==
-        last_three[1]
-        ==
-        last_three[2]
-
+        == last_three[1]
+        == last_three[2]
     ):
+        return current_quad
 
-        return last_three[-1]
-
-    return (
-
-        previous_rule
-        or
-        last_three[-1]
-
-    )
+    return previous_rule or current_quad
 
 
-def mode_value(
-
-    values: list[int]
-
+def calculate_mode_with_recent_tie_break(
+    values: list[int],
 ) -> Optional[int]:
+    """
+    Return the most frequent value.
 
+    When multiple values have the same frequency, return the most
+    recently occurring tied value.
+    """
     if not values:
-
         return None
 
-    counts = {}
+    counts = Counter(values)
+    maximum_count = max(counts.values())
 
-    for value in values:
-
-        counts[value] = (
-
-            counts.get(
-
-                value,
-
-                0
-
-            )
-
-            + 1
-
-        )
-
-    max_count = max(
-
-        counts.values()
-
-    )
-
-    candidates = [
-
+    tied_values = {
         value
+        for value, count in counts.items()
+        if count == maximum_count
+    }
 
-        for value,
-
-        count
-
-        in counts.items()
-
-        if count == max_count
-
-    ]
-
-    # Excel MODE behavior is not
-    # reliably defined for ties.
-    #
-    # We use the most recent tied value.
     for value in reversed(values):
-
-        if value in candidates:
-
+        if value in tied_values:
             return value
 
-    return candidates[0]
+    return values[-1]
 
 
 def calculate_7_day_rule(
-
     qad_history: list[int],
-
-    previous_rule: Optional[int]
-
 ) -> Optional[int]:
+    """
+    Return the mode of the latest seven QAD values.
+    """
+    if not qad_history:
+        return None
 
-    if len(
+    if len(qad_history) < 7:
+        return qad_history[-1]
 
-        qad_history
-
-    ) < 7:
-
-        return (
-
-            previous_rule
-            or
-            qad_history[-1]
-
-        )
-
-    last_seven = (
-
+    return calculate_mode_with_recent_tie_break(
         qad_history[-7:]
-
-    )
-
-    return mode_value(
-
-        last_seven
-
     )
 
 
 def calculate_confirmed_regime(
-
     quad_history: list[str],
-
-    previous_confirmed: Optional[str]
-
-) -> Optional[str]:
-
+    previous_confirmed: Optional[str],
+) -> str:
     """
-
-    New signal must appear five consecutive
-    times before the confirmed regime changes.
-
-    Equivalent to:
-
-        COUNTIF(last five, current) = 5
-
-    and current != previous confirmed signal.
-
+    Change the confirmed regime only after the current quadrant has
+    appeared for five consecutive observations.
     """
-
-    current = quad_history[-1]
-
-    if (
-
-        current is None
-
-        or
-
-        current == ""
-
-    ):
-
-        return previous_confirmed
+    current_quad = quad_history[-1]
 
     if previous_confirmed is None:
+        return current_quad
 
-        return current
-
-    if current == previous_confirmed:
-
+    if current_quad == previous_confirmed:
         return previous_confirmed
 
-    if len(
-
-        quad_history
-
-    ) < settings.CONFIRM_DAYS:
-
+    if len(quad_history) < settings.CONFIRM_DAYS:
         return previous_confirmed
 
-    last_five = (
+    recent_values = quad_history[
+        -settings.CONFIRM_DAYS:
+    ]
 
-        quad_history[
-
-            -settings.CONFIRM_DAYS:
-
-        ]
-
+    has_required_streak = all(
+        value == current_quad
+        for value in recent_values
     )
 
-    if (
-
-        len(
-
-            last_five
-
-        )
-
-        ==
-
-        settings.CONFIRM_DAYS
-
-        and
-
-        all(
-
-            value == current
-
-            for value in last_five
-
-        )
-
-    ):
-
-        return current
+    if has_required_streak:
+        return current_quad
 
     return previous_confirmed
 
 
 def calculate_trade_regime(
-
     quad_history: list[str],
-
-    previous_trade: Optional[str]
-
-) -> Optional[str]:
-
+    previous_trade: Optional[str],
+) -> str:
     """
+    Change the trade regime when:
 
-    New regime must satisfy:
-
-    1. Current signal appears for
-       five consecutive rows.
-
-    2. Current signal appears at least
-       nine times in the latest 15 rows.
-
+    1. The current quadrant appears for five consecutive observations.
+    2. The same quadrant appears at least nine times in the latest
+       fifteen observations.
     """
-
-    current = quad_history[-1]
-
-    if (
-
-        current is None
-
-        or
-
-        current == ""
-
-    ):
-
-        return previous_trade
+    current_quad = quad_history[-1]
 
     if previous_trade is None:
+        return current_quad
 
-        return current
-
-    if current == previous_trade:
-
+    if current_quad == previous_trade:
         return previous_trade
 
-    last_five = (
+    last_five = quad_history[
+        -settings.CONFIRM_DAYS:
+    ]
 
-        quad_history[
+    last_fifteen = quad_history[
+        -settings.TRADE_LOOKBACK_DAYS:
+    ]
 
-            -settings.CONFIRM_DAYS:
-
-        ]
-
-    )
-
-    last_fifteen = (
-
-        quad_history[
-
-            -settings.TRADE_LOOKBACK_DAYS:
-
-        ]
-
-    )
-
-    five_day_streak = (
-
-        len(
-
-            last_five
-
-        )
-
-        ==
-
-        settings.CONFIRM_DAYS
-
-        and
-
-        all(
-
-            value == current
-
+    has_five_day_streak = (
+        len(last_five)
+        == settings.CONFIRM_DAYS
+        and all(
+            value == current_quad
             for value in last_five
-
         )
-
     )
 
-    occurrences = sum(
-
-        value == current
-
+    occurrence_count = sum(
+        value == current_quad
         for value in last_fifteen
-
     )
 
     if (
-
-        five_day_streak
-
-        and
-
-        occurrences
-
-        >=
-
-        settings.TRADE_THRESHOLD
-
+        has_five_day_streak
+        and occurrence_count
+        >= settings.TRADE_THRESHOLD
     ):
-
-        return current
+        return current_quad
 
     return previous_trade
 
 
-def calculate_new_rows(
-
+def prepare_historical_dataframe(
     historical_df: pd.DataFrame,
-
-    new_rows: pd.DataFrame
-
 ) -> pd.DataFrame:
+    missing_columns = [
+        column
+        for column in OUTPUT_COLUMNS
+        if column not in historical_df.columns
+    ]
 
-    """
-
-    historical_df:
-        Existing Excel history.
-
-    new_rows:
-        New FRED observations after
-        the existing last date.
-
-    Only new rows are returned.
-
-    """
-
-    combined = pd.concat(
-
-        [
-
-            historical_df,
-
-            new_rows
-
-        ],
-
-        ignore_index=True
-
-    )
-
-    combined = (
-
-        combined
-
-        .sort_values(
-
-            settings.DATE_COLUMN
-
+    if missing_columns:
+        raise ValueError(
+            "The historical workbook is missing columns: "
+            + ", ".join(missing_columns)
         )
 
-        .reset_index(
+    result = historical_df[
+        OUTPUT_COLUMNS
+    ].copy()
 
-            drop=True
+    result[settings.DATE_COLUMN] = pd.to_datetime(
+        result[settings.DATE_COLUMN],
+        errors="coerce",
+    )
 
+    result[settings.VALUE_COLUMN] = pd.to_numeric(
+        result[settings.VALUE_COLUMN],
+        errors="coerce",
+    )
+
+    result = result.dropna(
+        subset=[
+            settings.DATE_COLUMN,
+            settings.VALUE_COLUMN,
+        ]
+    )
+
+    result = (
+        result
+        .sort_values(settings.DATE_COLUMN)
+        .drop_duplicates(
+            subset=[settings.DATE_COLUMN],
+            keep="last",
+        )
+        .reset_index(drop=True)
+    )
+
+    if result.empty:
+        raise ValueError(
+            "The historical workbook contains no valid observations."
         )
 
+    return result
+
+
+def prepare_new_values_dataframe(
+    new_values_df: pd.DataFrame,
+) -> pd.DataFrame:
+    required_columns = [
+        settings.DATE_COLUMN,
+        settings.VALUE_COLUMN,
+    ]
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in new_values_df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "The new-values workbook is missing columns: "
+            + ", ".join(missing_columns)
+        )
+
+    result = new_values_df[
+        required_columns
+    ].copy()
+
+    result[settings.DATE_COLUMN] = pd.to_datetime(
+        result[settings.DATE_COLUMN],
+        errors="coerce",
     )
 
-    combined[
-        settings.VALUE_COLUMN
-    ] = pd.to_numeric(
-
-        combined[
-            settings.VALUE_COLUMN
-        ],
-
-        errors="coerce"
-
+    result[settings.VALUE_COLUMN] = pd.to_numeric(
+        result[settings.VALUE_COLUMN],
+        errors="coerce",
     )
 
-    # Existing values are preserved.
-    #
-    # New calculations are calculated
-    # only for rows added after the
-    # previous last date.
-
-    last_existing_date = (
-
-        historical_df[
-            settings.DATE_COLUMN
-        ]
-
-        .max()
-
+    invalid_mask = (
+        result[settings.DATE_COLUMN].isna()
+        | result[settings.VALUE_COLUMN].isna()
     )
 
-    new_indices = (
+    if invalid_mask.any():
+        invalid_rows = result.index[
+            invalid_mask
+        ].tolist()
 
-        combined[
-            settings.DATE_COLUMN
-        ]
+        raise ValueError(
+            "The new-values workbook contains invalid data at "
+            f"rows: {', '.join(str(row + 2) for row in invalid_rows)}"
+        )
 
-        >
+    if (
+        result[settings.VALUE_COLUMN] < 0
+    ).any():
+        raise ValueError(
+            "BAMLH0A0HYM2 values cannot be negative."
+        )
 
-        last_existing_date
-
+    result = (
+        result
+        .sort_values(settings.DATE_COLUMN)
+        .drop_duplicates(
+            subset=[settings.DATE_COLUMN],
+            keep="last",
+        )
+        .reset_index(drop=True)
     )
 
-    # Historical calculation histories
-    quad_history = []
+    if result.empty:
+        raise ValueError(
+            "The new-values workbook contains no valid observations."
+        )
 
-    qad_history = []
+    return result
 
-    previous_3_day = None
 
-    previous_confirmed = None
+def get_historical_state(
+    historical_df: pd.DataFrame,
+) -> tuple[
+    list[str],
+    list[int],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]:
+    """
+    Build the existing state required to calculate newly appended rows.
+    """
+    quad_history: list[str] = []
+    qad_history: list[int] = []
 
-    previous_trade = None
+    previous_rule_3: Optional[str] = None
+    previous_confirmed: Optional[str] = None
+    previous_trade: Optional[str] = None
 
-    # Reconstruct historical state
-    # from the existing workbook.
     for _, row in historical_df.iterrows():
-
-        quad = row.get(
-
-            settings.QUAD_COLUMN
-
+        quad = clean_optional_string(
+            row.get(settings.QUAD_COLUMN)
         )
 
-        qad = row.get(
-
-            settings.QAD_VALUE_COLUMN
-
+        qad_value = clean_optional_integer(
+            row.get(settings.QAD_VALUE_COLUMN)
         )
 
-        rule_3 = row.get(
-
-            settings.RULE_3_COLUMN
-
+        rule_3 = clean_optional_string(
+            row.get(settings.RULE_3_COLUMN)
         )
 
-        confirmed = row.get(
-
-            settings.CONFIRMED_COLUMN
-
+        confirmed = clean_optional_string(
+            row.get(settings.CONFIRMED_COLUMN)
         )
 
-        trade = row.get(
-
-            settings.TRADE_COLUMN
-
+        trade = clean_optional_string(
+            row.get(settings.TRADE_COLUMN)
         )
 
-        if pd.notna(quad):
+        if quad is not None:
+            quad_history.append(quad)
 
-            quad_history.append(
+        if qad_value is not None:
+            qad_history.append(qad_value)
 
-                str(
-                    quad
-                )
+        if rule_3 is not None:
+            previous_rule_3 = rule_3
 
-            )
+        if confirmed is not None:
+            previous_confirmed = confirmed
 
-        if pd.notna(qad):
+        if trade is not None:
+            previous_trade = trade
 
-            qad_history.append(
+    if not quad_history:
+        raise ValueError(
+            "The historical workbook contains no valid quadrant history."
+        )
 
-                int(
-                    qad
-                )
+    if not qad_history:
+        raise ValueError(
+            "The historical workbook contains no valid QAD Value history."
+        )
 
-            )
+    return (
+        quad_history,
+        qad_history,
+        previous_rule_3,
+        previous_confirmed,
+        previous_trade,
+    )
 
-        if pd.notna(rule_3):
 
-            previous_3_day = str(
+def append_new_observations(
+    historical_df: pd.DataFrame,
+    new_values_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Append every new observation sequentially.
 
-                rule_3
+    Each new row is calculated using:
+    - All historical rows.
+    - All new rows already calculated during this request.
+    """
+    historical = prepare_historical_dataframe(
+        historical_df
+    )
 
-            )
+    new_values = prepare_new_values_dataframe(
+        new_values_df
+    )
 
-        if pd.notna(confirmed):
+    latest_historical_date = historical[
+        settings.DATE_COLUMN
+    ].max()
 
-            previous_confirmed = str(
-
-                confirmed
-
-            )
-
-        if pd.notna(trade):
-
-            previous_trade = str(
-
-                trade
-
-            )
-
-    results = []
-
-    for index, row in combined.iterrows():
-
-        current_date = row[
-
+    historical_dates = set(
+        historical[
             settings.DATE_COLUMN
+        ].dt.normalize()
+    )
 
-        ]
+    pending = new_values[
+        (
+            new_values[settings.DATE_COLUMN]
+            > latest_historical_date
+        )
+        &
+        (
+            ~new_values[
+                settings.DATE_COLUMN
+            ]
+            .dt.normalize()
+            .isin(historical_dates)
+        )
+    ].copy()
 
-        if (
+    pending = (
+        pending
+        .sort_values(settings.DATE_COLUMN)
+        .reset_index(drop=True)
+    )
 
-            current_date
-            <=
-            last_existing_date
+    if pending.empty:
+        raise ValueError(
+            "No new rows were found. All new-values dates already "
+            "exist in the historical workbook or are not later than "
+            f"the latest historical date "
+            f"{latest_historical_date.date()}."
+        )
 
-        ):
+    (
+        quad_history,
+        qad_history,
+        previous_rule_3,
+        previous_confirmed,
+        previous_trade,
+    ) = get_historical_state(
+        historical
+    )
 
-            continue
+    result = historical[
+        OUTPUT_COLUMNS
+    ].copy()
 
-        current_value = float(
+    appended_rows: list[
+        dict[str, object]
+    ] = []
 
-            row[
+    for _, new_input_row in pending.iterrows():
+        new_date = pd.Timestamp(
+            new_input_row[
+                settings.DATE_COLUMN
+            ]
+        )
+
+        new_value = float(
+            new_input_row[
                 settings.VALUE_COLUMN
             ]
-
         )
 
-        # --------------------------------
-        # 90-Day Slope
-        # --------------------------------
-
-        all_values_until_today = (
-
-            combined
-
-            .loc[
-
-                :index,
-
-                settings.VALUE_COLUMN
-
-            ]
-
+        # Include the current new value when calculating
+        # slope and medians.
+        all_values = pd.concat(
+            [
+                result[
+                    settings.VALUE_COLUMN
+                ],
+                pd.Series(
+                    [new_value],
+                    dtype=float,
+                ),
+            ],
+            ignore_index=True,
         )
 
-        slope = calculate_90_day_slope(
-
-            all_values_until_today
-
+        slope = calculate_rolling_slope(
+            all_values
         )
 
-        # --------------------------------
-        # 90-Day Median
-        # --------------------------------
-
-        median_90 = calculate_90_day_median(
-
-            all_values_until_today
-
+        median_90 = calculate_rolling_median(
+            all_values,
+            settings.MEDIAN_90_WINDOW,
         )
 
-        # --------------------------------
-        # 10-Year Median
-        # --------------------------------
-
-        median_10_year = calculate_10_year_median(
-
-            all_values_until_today
-
+        median_10_year = calculate_rolling_median(
+            all_values,
+            settings.MEDIAN_10Y_WINDOW,
         )
-
-        # --------------------------------
-        # QAD
-        # --------------------------------
 
         quad = classify_quad(
-
-            current_value,
-
-            median_90,
-
-            median_10_year
-
+            current_value=new_value,
+            median_90=median_90,
+            median_10_year=median_10_year,
         )
 
         quad_history.append(
-
             quad
-
         )
-
-        # --------------------------------
-        # 3-Day Rule
-        # --------------------------------
 
         rule_3 = calculate_3_day_rule(
-
-            quad_history,
-
-            previous_3_day
-
+            quad_history=quad_history,
+            previous_rule=previous_rule_3,
         )
 
-        previous_3_day = rule_3
-
-        # --------------------------------
-        # QAD Value
-        # --------------------------------
-
-        qad = get_qad_value(
-
+        qad_value = get_qad_value(
             quad
-
         )
 
         qad_history.append(
-
-            qad
-
+            qad_value
         )
-
-        # --------------------------------
-        # 7-Day Rule
-        # --------------------------------
 
         rule_7 = calculate_7_day_rule(
-
-            qad_history,
-
-            None
-
+            qad_history
         )
 
-        # --------------------------------
-        # Confirmed Regime
-        # --------------------------------
-
-        confirmed = calculate_confirmed_regime(
-
-            quad_history,
-
-            previous_confirmed
-
+        confirmed_regime = (
+            calculate_confirmed_regime(
+                quad_history=quad_history,
+                previous_confirmed=previous_confirmed,
+            )
         )
 
-        previous_confirmed = confirmed
-
-        # --------------------------------
-        # Trade Regime
-        # --------------------------------
-
-        trade = calculate_trade_regime(
-
-            quad_history,
-
-            previous_trade
-
+        trade_regime = calculate_trade_regime(
+            quad_history=quad_history,
+            previous_trade=previous_trade,
         )
 
-        previous_trade = trade
+        calculated_row: dict[str, object] = {
+            settings.DATE_COLUMN:
+                new_date,
 
-        results.append(
+            settings.VALUE_COLUMN:
+                new_value,
 
-            {
-
-                settings.DATE_COLUMN:
-                current_date,
-
-                settings.VALUE_COLUMN:
-                current_value,
-
-                settings.SLOPE_COLUMN:
+            settings.SLOPE_COLUMN:
                 slope,
 
-                settings.MEDIAN_90_COLUMN:
+            settings.MEDIAN_90_COLUMN:
                 median_90,
 
-                settings.MEDIAN_10Y_COLUMN:
+            settings.MEDIAN_10Y_COLUMN:
                 median_10_year,
 
-                settings.QUAD_COLUMN:
+            settings.QUAD_COLUMN:
                 quad,
 
-                settings.RULE_3_COLUMN:
+            settings.RULE_3_COLUMN:
                 rule_3,
 
-                settings.QAD_VALUE_COLUMN:
-                qad,
+            settings.QAD_VALUE_COLUMN:
+                qad_value,
 
-                settings.RULE_7_COLUMN:
+            settings.RULE_7_COLUMN:
                 rule_7,
 
-                settings.CONFIRMED_COLUMN:
-                confirmed,
+            settings.CONFIRMED_COLUMN:
+                confirmed_regime,
 
-                settings.TRADE_COLUMN:
-                trade
+            settings.TRADE_COLUMN:
+                trade_regime,
+        }
 
-            }
-
+        appended_rows.append(
+            calculated_row
         )
 
-    return pd.DataFrame(
+        result = pd.concat(
+            [
+                result,
+                pd.DataFrame(
+                    [calculated_row],
+                    columns=OUTPUT_COLUMNS,
+                ),
+            ],
+            ignore_index=True,
+        )
 
-        results
+        # Carry the newly calculated state into the next row.
+        previous_rule_3 = rule_3
+        previous_confirmed = confirmed_regime
+        previous_trade = trade_regime
 
+    result = (
+        result
+        .sort_values(settings.DATE_COLUMN)
+        .drop_duplicates(
+            subset=[settings.DATE_COLUMN],
+            keep="last",
+        )
+        .reset_index(drop=True)
     )
+
+    appended_dataframe = pd.DataFrame(
+        appended_rows,
+        columns=OUTPUT_COLUMNS,
+    )
+
+    return result, appended_dataframe
